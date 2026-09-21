@@ -91,8 +91,12 @@ def send_otp_email(email: str, otp: str, expires_minutes: int = 10) -> None:
 
 
 def _send_via_brevo(email: str, otp: str, expires_minutes: int, api_key: str, sender_name: str) -> None:
-    """Send OTP email via Brevo HTTP API with short timeout for speed."""
-    from_email = os.getenv("BREVO_FROM_EMAIL", "sachlensuserauth@gmail.com").strip()
+    """Send OTP email via Brevo HTTP API with detailed HTTP error extraction."""
+    from_email = (
+        os.getenv("BREVO_FROM_EMAIL")
+        or os.getenv("SMTP_FROM_EMAIL")
+        or "sachlensuserauth@gmail.com"
+    ).strip()
     subject = os.getenv("OTP_EMAIL_SUBJECT", "Your SachLens OTP Code")
 
     html_body = _OTP_HTML_TEMPLATE.format(otp=otp, expires_minutes=expires_minutes, sender_name=sender_name)
@@ -116,14 +120,25 @@ def _send_via_brevo(email: str, otp: str, expires_minutes: int, api_key: str, se
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=6) as resp:
-        resp_body = resp.read().decode("utf-8")
-        logger.info("Brevo response status=%s body=%s", resp.status, resp_body)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp_body = resp.read().decode("utf-8")
+            logger.info("Brevo response status=%s body=%s", resp.status, resp_body)
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+        logger.error("Brevo API HTTP %d error: %s (sender=%s)", exc.code, err_body, from_email)
+        raise EmailDeliveryError(f"Brevo HTTP {exc.code}: {err_body}") from exc
+    except Exception as exc:
+        logger.error("Brevo request failed: %s", exc)
+        raise EmailDeliveryError(f"Brevo request failed: {exc}") from exc
 
 
 def _send_via_resend(email: str, otp: str, expires_minutes: int, api_key: str, sender_name: str) -> None:
-    """Send OTP email via Resend HTTP API with short timeout for speed."""
-    from_email = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev").strip()
+    """Send OTP email via Resend HTTP API with detailed HTTP error extraction."""
+    from_email = (
+        os.getenv("RESEND_FROM_EMAIL")
+        or "onboarding@resend.dev"
+    ).strip()
     subject = os.getenv("OTP_EMAIL_SUBJECT", "Your SachLens OTP Code")
 
     html_body = _OTP_HTML_TEMPLATE.format(otp=otp, expires_minutes=expires_minutes, sender_name=sender_name)
@@ -146,9 +161,17 @@ def _send_via_resend(email: str, otp: str, expires_minutes: int, api_key: str, s
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=6) as resp:
-        resp_body = resp.read().decode("utf-8")
-        logger.info("Resend response status=%s body=%s", resp.status, resp_body)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp_body = resp.read().decode("utf-8")
+            logger.info("Resend response status=%s body=%s", resp.status, resp_body)
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+        logger.error("Resend API HTTP %d error: %s (sender=%s)", exc.code, err_body, from_email)
+        raise EmailDeliveryError(f"Resend HTTP {exc.code}: {err_body}") from exc
+    except Exception as exc:
+        logger.error("Resend request failed: %s", exc)
+        raise EmailDeliveryError(f"Resend request failed: {exc}") from exc
 
 
 def _send_via_smtp(email: str, otp: str, expires_minutes: int) -> None:
