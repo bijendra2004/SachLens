@@ -225,7 +225,8 @@ def on_startup() -> None:
     init_db(engine)
     prediction_service.load()
     gemini_key_present = bool((os.getenv("GEMINI_API_KEY") or "").strip())
-    logger.info("GEMINI_API_KEY configured: %s", gemini_key_present)
+    brevo_key_present = bool((os.getenv("BREVO_API_KEY") or "").strip())
+    logger.info("GEMINI_API_KEY configured: %s, BREVO_API_KEY configured: %s", gemini_key_present, brevo_key_present)
     start_cleanup_worker()
     start_keep_alive_worker(interval_seconds=600)
 
@@ -284,6 +285,21 @@ app.add_middleware(
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "message": "Server is active"}
+
+
+@app.get("/api/health/mailer")
+def mailer_health():
+    brevo_key = (os.getenv("BREVO_API_KEY") or "").strip()
+    resend_key = (os.getenv("RESEND_API_KEY") or "").strip()
+    smtp_host = (os.getenv("SMTP_HOST") or "").strip()
+    brevo_from = (os.getenv("BREVO_FROM_EMAIL") or os.getenv("SMTP_FROM_EMAIL") or "sachlensuserauth@gmail.com").strip()
+    return {
+        "brevo_configured": bool(brevo_key),
+        "brevo_key_preview": f"{brevo_key[:8]}...{brevo_key[-4:]}" if len(brevo_key) > 12 else ("SET" if brevo_key else "MISSING"),
+        "brevo_from_email": brevo_from,
+        "resend_configured": bool(resend_key),
+        "smtp_configured": bool(smtp_host),
+    }
 
 
 @app.post("/api/predict", response_model=PredictResponse)
@@ -480,7 +496,6 @@ def get_latest_feedback(db: Session = Depends(get_db)) -> FeedbackLatestResponse
 def otp_request(
     request: Request,
     payload: OtpRequestBody,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
     email = normalize_email(payload.email)
@@ -495,7 +510,13 @@ def otp_request(
     except ValueError as error:
         raise HTTPException(status_code=429, detail="Too many OTP requests") from error
 
-    background_tasks.add_task(deliver_otp_email_async, email, otp)
+    try:
+        send_otp_email(email, otp)
+    except EmailDeliveryError as error:
+        logger.error("OTP email delivery failed for %s: %s", email, error)
+        db.execute(delete(OTPChallenge).where(OTPChallenge.email == email))
+        db.commit()
+        raise HTTPException(status_code=502, detail=f"Email delivery failed: {error}") from error
 
     return {"ok": True}
 
