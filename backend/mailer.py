@@ -36,49 +36,56 @@ _OTP_HTML_TEMPLATE = """
 def send_otp_email(email: str, otp: str, expires_minutes: int = 10) -> None:
     """Send OTP email with fast automatic failover across configured providers.
 
-    1. Brevo HTTP API (Fast, sends to any recipient)
-    2. Resend HTTP API (Fast fallback)
-    3. SMTP (Local development fallback)
+    Configurable via EMAIL_PROVIDER (e.g. 'resend', 'brevo', 'smtp').
     """
     sender_name = os.getenv("SMTP_FROM_NAME", "SachLens").strip() or "SachLens"
+    preferred_provider = os.getenv("EMAIL_PROVIDER", "").strip().lower()
+
+    brevo_api_key = os.getenv("BREVO_API_KEY", "").strip()
+    resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+
+    providers_sequence: list[str] = []
+    if preferred_provider in ("resend", "brevo", "smtp"):
+        providers_sequence.append(preferred_provider)
+
+    for p in ["resend" if preferred_provider == "resend" else "brevo", "resend", "smtp"]:
+        if p not in providers_sequence:
+            providers_sequence.append(p)
+
     attempted_providers: list[str] = []
     errors: list[str] = []
 
-    # 1. Try Brevo HTTP API (primary)
-    brevo_api_key = os.getenv("BREVO_API_KEY", "").strip()
-    if brevo_api_key:
-        attempted_providers.append("Brevo")
-        try:
-            _send_via_brevo(email, otp, expires_minutes, brevo_api_key, sender_name)
-            logger.info("OTP email delivered successfully via Brevo to %s", email)
-            return
-        except Exception as error:
-            logger.warning("Brevo delivery failed for %s: %s; trying next provider", email, error)
-            errors.append(f"Brevo: {error}")
+    for provider in providers_sequence:
+        if provider == "brevo" and brevo_api_key:
+            attempted_providers.append("Brevo")
+            try:
+                _send_via_brevo(email, otp, expires_minutes, brevo_api_key, sender_name)
+                logger.info("OTP email delivered successfully via Brevo to %s", email)
+                return
+            except Exception as error:
+                logger.warning("Brevo delivery failed for %s: %s; trying next provider", email, error)
+                errors.append(f"Brevo: {error}")
 
-    # 2. Try Resend HTTP API (secondary / fallback)
-    resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
-    if resend_api_key:
-        attempted_providers.append("Resend")
-        try:
-            _send_via_resend(email, otp, expires_minutes, resend_api_key, sender_name)
-            logger.info("OTP email delivered successfully via Resend to %s", email)
-            return
-        except Exception as error:
-            logger.warning("Resend delivery failed for %s: %s; trying next provider", email, error)
-            errors.append(f"Resend: {error}")
+        elif provider == "resend" and resend_api_key:
+            attempted_providers.append("Resend")
+            try:
+                _send_via_resend(email, otp, expires_minutes, resend_api_key, sender_name)
+                logger.info("OTP email delivered successfully via Resend to %s", email)
+                return
+            except Exception as error:
+                logger.warning("Resend delivery failed for %s: %s; trying next provider", email, error)
+                errors.append(f"Resend: {error}")
 
-    # 3. Fall back to SMTP (works locally, fallback if on non-blocked host)
-    smtp_host = os.getenv("SMTP_HOST", "").strip()
-    if smtp_host:
-        attempted_providers.append("SMTP")
-        try:
-            _send_via_smtp(email, otp, expires_minutes)
-            logger.info("OTP email delivered successfully via SMTP to %s", email)
-            return
-        except Exception as error:
-            logger.warning("SMTP delivery failed for %s: %s", email, error)
-            errors.append(f"SMTP: {error}")
+        elif provider == "smtp" and smtp_host:
+            attempted_providers.append("SMTP")
+            try:
+                _send_via_smtp(email, otp, expires_minutes)
+                logger.info("OTP email delivered successfully via SMTP to %s", email)
+                return
+            except Exception as error:
+                logger.warning("SMTP delivery failed for %s: %s", email, error)
+                errors.append(f"SMTP: {error}")
 
     # If no providers configured or all failed
     if not attempted_providers:
