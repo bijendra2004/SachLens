@@ -119,11 +119,24 @@ class GeminiExplainer:
             logger.info("TAVILY_API_KEY not configured — skipping web search grounding")
             return []
 
+        import datetime
+        current_year = datetime.datetime.now().strftime("%Y")
+        query_lower = query.lower()
+        is_recency_query = any(w in query_lower for w in [
+            "today", "aj", "aaj", "latest", "recent", "live", "current", "match",
+            "score", "result", "winner", "update", "now", "yesterday", "kal", "abhi"
+        ])
+
+        enriched_query = query
+        if is_recency_query and current_year not in query:
+            enriched_query = f"{query} {current_year}"
+
         payload = {
             "api_key": self.tavily_api_key,
-            "query": query[:400],  # Tavily query limit
-            "search_depth": "basic",
-            "max_results": 5,
+            "query": enriched_query[:400],
+            "topic": "news" if is_recency_query else "general",
+            "search_depth": "advanced" if is_recency_query else "basic",
+            "max_results": 6,
             "include_answer": True,
         }
 
@@ -133,14 +146,14 @@ class GeminiExplainer:
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=12) as response:
                 data = json.loads(response.read().decode("utf-8"))
 
             results = data.get("results", [])
             self._last_tavily_answer = data.get("answer")
             logger.info(
-                "Tavily search succeeded: %d results (answer_present=%s) for query=%s",
-                len(results), bool(self._last_tavily_answer), query[:80],
+                "Tavily search succeeded: %d results (answer_present=%s, topic=%s) for query=%s",
+                len(results), bool(self._last_tavily_answer), payload["topic"], enriched_query[:80],
             )
             return results
 
@@ -462,7 +475,9 @@ class GeminiExplainer:
         web_search_results: list[dict[str, Any]] | None = None,
     ) -> str:
         import datetime
-        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        now = datetime.datetime.now()
+        current_date = now.strftime("%Y-%m-%d")
+        current_year = now.strftime("%Y")
 
         # --- Web search context from Tavily ---
         web_search_section = ""
@@ -501,8 +516,14 @@ class GeminiExplainer:
             fact_check_section = "\n".join(lines)
 
         return (
-            f"Current Date: {current_date}\n"
+            f"Current Date: {current_date} (Current Year: {current_year})\n"
             "You are SachLens AI, an intelligent verification and factual answering assistant.\n\n"
+            "MANDATORY RECENCY & FRESHNESS RULES:\n"
+            f"- The present date is {current_date} and year is {current_year}.\n"
+            "- When user asks for 'today' / 'aj' / 'latest' / 'recent' matches, events, or news:\n"
+            f"  * ALWAYS prioritize the most recent {current_year} reports and outcomes.\n"
+            "  * STRICTLY DISCARD old historical archives from past years (e.g., 2023, 2022, 2021) even if older match reports appear in search results.\n"
+            f"  * Focus solely on the latest current {current_year} match/status.\n\n"
             "STEP 1: DETECT USER INTENT (MANDATORY):\n"
             "Determine if the user input is:\n"
             "A) INFORMATIONAL QUESTION ('mode': 'ANSWER'):\n"
@@ -554,7 +575,15 @@ class GeminiExplainer:
         grounded: bool,
     ) -> ExplanationResult:
         """Create an intelligent, clean, and concise synthesized fallback when LLMs are unreachable."""
+        import datetime
+        current_year = datetime.datetime.now().strftime("%Y")
         lower = text.lower()
+        is_recency_query = any(w in lower for w in [
+            "today", "aj", "aaj", "latest", "recent", "live", "current", "match",
+            "score", "result", "winner", "update", "now", "yesterday", "kal", "abhi"
+        ])
+        old_years = [y for y in ["2019", "2020", "2021", "2022", "2023", "2024", "2025"] if y != current_year]
+
         is_question = bool(
             "?" in text
             or any(w in lower for w in [
@@ -580,10 +609,14 @@ class GeminiExplainer:
                 for s in sentences:
                     s_lower = s.lower()
                     if len(s) < 180 and not any(kw in s_lower for kw in unwanted_keywords):
-                        # Avoid echoing user's exact accusation
+                        # If user asked for today/latest, skip sentences referencing old past years
+                        if is_recency_query and any(y in s_lower for y in old_years) and current_year not in s_lower:
+                            continue
                         if is_rumor_or_allegation and ("cheating" in s_lower or "cheater" in s_lower):
                             continue
                         score = sum(2 for kw in priority_keywords if kw in s_lower)
+                        if current_year in s_lower:
+                            score += 3
                         candidate_sentences.append((score, s))
 
             # Sort by relevance score
@@ -613,7 +646,7 @@ class GeminiExplainer:
                     if clean_bullets:
                         tavily_ans = clean_bullets[0]
                     else:
-                        tavily_ans = f"Information retrieved for: {text[:80]}"
+                        tavily_ans = f"Latest information retrieved for: {text[:80]}"
 
             return ExplanationResult(
                 percentage=pct,
