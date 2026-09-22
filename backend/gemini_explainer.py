@@ -51,6 +51,9 @@ class GeminiExplainer:
         self.groq_model = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 
         self._last_tavily_answer: str | None = None
+        # Fast in-memory TTL response cache (query_hash -> (timestamp, result))
+        self._cache: dict[str, tuple[float, ExplanationResult]] = {}
+        self._follow_up_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
         logger.info(
             "LLM provider=%s, groq_model=%s, gemini_model=%s",
@@ -61,8 +64,32 @@ class GeminiExplainer:
         if not self.groq_api_key and not self.api_key:
             raise GeminiExplanationError("Neither GEMINI_API_KEY nor GROQ_API_KEY is configured")
 
+    def _get_cached_explanation(self, key: str) -> ExplanationResult | None:
+        import time
+        now = time.time()
+        if key in self._cache:
+            ts, res = self._cache[key]
+            if now - ts < 300:  # 5 minutes TTL
+                logger.info("Cache hit for query '%s' - returning instant result", key[:40])
+                return res
+            del self._cache[key]
+        return None
+
+    def _set_cached_explanation(self, key: str, res: ExplanationResult) -> None:
+        import time
+        if len(self._cache) > 250:
+            # Evict oldest
+            oldest_key = min(self._cache, key=lambda k: self._cache[k][0])
+            self._cache.pop(oldest_key, None)
+        self._cache[key] = (time.time(), res)
+
     def explain(self, text: str, classifier_signal: dict[str, Any]) -> ExplanationResult:
-        # Run Tavily search and Google Fact Check API concurrently
+        cache_key = re.sub(r"\s+", " ", text.strip().lower())
+        cached = self._get_cached_explanation(cache_key)
+        if cached:
+            return cached
+
+        # Run Tavily search and Google Fact Check API concurrently with tight timeouts for speed
         import concurrent.futures
         tavily_results: list[dict[str, Any]] = []
         fact_check_results: list[dict[str, str]] = []
@@ -72,14 +99,14 @@ class GeminiExplainer:
             tavily_future = executor.submit(self._search_tavily, text)
             fact_check_future = executor.submit(self._query_fact_check_api, text)
             try:
-                tavily_results = tavily_future.result(timeout=6)
+                tavily_results = tavily_future.result(timeout=4.0)
             except Exception as e:
-                logger.warning("Tavily search parallel task failed: %s", e)
+                logger.warning("Tavily search parallel task failed/timed out: %s", e)
                 tavily_results = []
             try:
-                fact_check_results = fact_check_future.result(timeout=6)
+                fact_check_results = fact_check_future.result(timeout=2.0)
             except Exception as e:
-                logger.warning("Fact Check parallel task failed: %s", e)
+                logger.warning("Fact Check parallel task failed/timed out: %s", e)
                 fact_check_results = []
 
         grounded = len(tavily_results) > 0
@@ -102,12 +129,15 @@ class GeminiExplainer:
         # --- LLM call with fallback across providers and heuristic fallback ---
         try:
             text_output = self._call_llm(prompt, temperature=0.2)
-            logger.info("LLM raw text output: %s", text_output[:500])
             parsed = self._parse_response_json(text_output)
-            return self._validate_response(parsed, sources=sources, grounded=grounded)
+            res = self._validate_response(parsed, sources=sources, grounded=grounded)
+            self._set_cached_explanation(cache_key, res)
+            return res
         except Exception as exc:
             logger.warning("All LLM reasoning providers failed: %s. Using enhanced fallback.", exc)
-            return self._build_enhanced_fallback(text, classifier_signal, tavily_results, sources, grounded)
+            res = self._build_enhanced_fallback(text, classifier_signal, tavily_results, sources, grounded)
+            self._set_cached_explanation(cache_key, res)
+            return res
 
     def _search_tavily(self, query: str) -> list[dict[str, Any]]:
         """Search the web using Tavily API for real-time grounding context.
@@ -135,8 +165,8 @@ class GeminiExplainer:
             "api_key": self.tavily_api_key,
             "query": enriched_query[:400],
             "topic": "news" if is_recency_query else "general",
-            "search_depth": "advanced" if is_recency_query else "basic",
-            "max_results": 6,
+            "search_depth": "basic",  # basic is 3x faster than advanced (~400ms vs ~2.5s)
+            "max_results": 4,         # 4 top sources are faster and optimal for fact extraction
             "include_answer": True,
         }
 
@@ -146,7 +176,7 @@ class GeminiExplainer:
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=12) as response:
+            with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode("utf-8"))
 
             results = data.get("results", [])
@@ -201,7 +231,11 @@ class GeminiExplainer:
     def _call_gemini_raw(self, prompt: str, *, temperature: float = 0.2) -> str:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": temperature},
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": 700,
+                "responseMimeType": "application/json",
+            },
         }
         raw = self._request_with_fallback(
             json.dumps(payload).encode("utf-8"),
@@ -213,7 +247,7 @@ class GeminiExplainer:
     def _call_groq(self, prompt: str, *, temperature: float = 0.2) -> str:
         """Call Groq's OpenAI-compatible chat completions API with multi-model rate-limit fallback."""
         models_to_try: list[str] = []
-        for m in [self.groq_model, "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]:
+        for m in [self.groq_model, "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
             norm = m.strip()
             if norm and norm not in models_to_try:
                 models_to_try.append(norm)
@@ -235,7 +269,8 @@ class GeminiExplainer:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": temperature,
-                "max_tokens": 3072,
+                "max_tokens": 700,
+                "response_format": {"type": "json_object"},
             }
 
             for attempt in range(2):
@@ -249,7 +284,7 @@ class GeminiExplainer:
                             "User-Agent": "SachLens/1.0",
                         },
                     )
-                    with urllib.request.urlopen(req, timeout=15) as response:
+                    with urllib.request.urlopen(req, timeout=6) as response:
                         data = json.loads(response.read().decode("utf-8"))
 
                     content = data["choices"][0]["message"]["content"]
@@ -282,13 +317,10 @@ class GeminiExplainer:
         models_to_try: list[str] = []
         for model_name in [
             self.model,
-            "gemini-1.5-flash",
             "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
             "gemini-2.0-flash",
-            "gemini-1.5-pro",
-            "gemini-flash-latest",
-            "gemini-1.5-flash-8b",
+            "gemini-1.5-flash",
+            "gemini-2.5-flash-lite",
         ]:
             normalized = model_name.strip()
             if normalized and normalized not in models_to_try:
@@ -308,7 +340,7 @@ class GeminiExplainer:
                     method="POST",
                     headers={"Content-Type": "application/json"},
                 )
-                with urllib.request.urlopen(req, timeout=30) as response:
+                with urllib.request.urlopen(req, timeout=8) as response:
                     return response.read().decode("utf-8")
             except urllib.error.HTTPError as error:
                 error_body = error.read().decode("utf-8", errors="ignore") if error.fp else ""
@@ -731,8 +763,17 @@ class GeminiExplainer:
         history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Answer follow-up user queries maintaining previous context."""
+        import time
         import datetime
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        follow_up_key = f"{query.strip().lower()} ||| {previous_context[:80].strip().lower()}"
+        now_ts = time.time()
+        if follow_up_key in self._follow_up_cache:
+            ts, cached_res = self._follow_up_cache[follow_up_key]
+            if now_ts - ts < 300:
+                logger.info("Follow-up cache hit for '%s'", query[:40])
+                return cached_res
 
         # Tavily search for follow up query
         search_query = f"{query} {previous_context[:100]}".strip()
@@ -783,12 +824,17 @@ class GeminiExplainer:
             rel_q = parsed.get("related_questions")
             if not isinstance(rel_q, list):
                 rel_q = []
-            return {
+            final_res = {
                 "direct_answer": direct_ans or "Here is the information for your question.",
                 "explanation": [str(x) for x in expl if str(x).strip()],
                 "sources": sources,
                 "related_questions": [str(q) for q in rel_q if str(q).strip()],
             }
+            if len(self._follow_up_cache) > 200:
+                oldest_k = min(self._follow_up_cache, key=lambda k: self._follow_up_cache[k][0])
+                self._follow_up_cache.pop(oldest_k, None)
+            self._follow_up_cache[follow_up_key] = (now_ts, final_res)
+            return final_res
         except Exception as exc:
             logger.warning("Follow-up answer LLM failed: %s. Using Tavily fallback.", exc)
             fallback_ans = tavily_results[0].get("content", "")[:250] if tavily_results else "Information retrieved for your follow-up inquiry."
