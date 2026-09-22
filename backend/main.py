@@ -228,7 +228,7 @@ def on_startup() -> None:
     brevo_key_present = bool((os.getenv("BREVO_API_KEY") or "").strip())
     logger.info("GEMINI_API_KEY configured: %s, BREVO_API_KEY configured: %s", gemini_key_present, brevo_key_present)
     start_cleanup_worker()
-    start_keep_alive_worker(interval_seconds=600)
+    start_keep_alive_worker(interval_seconds=240)
 
 
 @app.middleware("http")

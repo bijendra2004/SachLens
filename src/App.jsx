@@ -456,22 +456,31 @@ function App() {
     setAuthLoading(true)
     setAuthError('')
     try {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 35000)
+
       const response = await fetch(`${API_BASE_URL}/api/auth/otp-request`, {
         method: 'POST',
         headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
         credentials: 'include',
         body: JSON.stringify({ email }),
+        signal: controller.signal,
       })
+      clearTimeout(timeoutId)
 
       const payload = await readJsonResponse(response)
       if (!response.ok) {
-        throw new Error(formatApiError(payload, 'Unable to send OTP.'))
+        throw new Error(formatApiError(payload, 'Unable to send OTP. Server might be waking up, please retry in a few seconds.'))
       }
 
       setAuthStep('otp')
       setResendSecondsLeft(OTP_RESEND_SECONDS)
     } catch (error) {
-      setAuthError(error.message)
+      if (error.name === 'AbortError') {
+        setAuthError('Server is waking up from standby. Please click Send OTP again in 5 seconds.')
+      } else {
+        setAuthError(error.message)
+      }
     } finally {
       setAuthLoading(false)
     }

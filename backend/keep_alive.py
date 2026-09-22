@@ -9,10 +9,10 @@ import urllib.request
 logger = logging.getLogger("sachlens.keep_alive")
 
 
-async def keep_alive_loop(interval_seconds: int = 600) -> None:
+async def keep_alive_loop(interval_seconds: int = 240) -> None:
     """Periodically ping own health endpoint to keep server awake on free tier hosting."""
     # Grace period on startup before the first ping
-    await asyncio.sleep(20)
+    await asyncio.sleep(15)
 
     while True:
         raw_url = (
@@ -44,7 +44,7 @@ async def keep_alive_loop(interval_seconds: int = 600) -> None:
         await asyncio.sleep(interval_seconds)
 
 
-def start_keep_alive_worker(interval_seconds: int = 600) -> asyncio.Task:
+def start_keep_alive_worker(interval_seconds: int = 240) -> asyncio.Task:
     """Spawn the self-ping background task."""
     try:
         loop = asyncio.get_running_loop()
