@@ -151,6 +151,22 @@ class PredictResponse(BaseModel):
     sources: list[dict[str, str]] | None = None
     grounded: bool = False
     is_ai_generated: bool = False
+    mode: str = "VERIFY"
+    direct_answer: str | None = None
+    related_questions: list[str] = Field(default_factory=list)
+
+
+class FollowUpRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=1000)
+    previous_context: str = Field(min_length=1, max_length=4000)
+    history: list[dict[str, str]] | None = None
+
+
+class FollowUpResponse(BaseModel):
+    direct_answer: str
+    explanation: list[str] = Field(default_factory=list)
+    sources: list[dict[str, str]] | None = None
+    related_questions: list[str] = Field(default_factory=list)
 
 
 
@@ -408,6 +424,32 @@ def predict_link(request: Request, payload: PredictLinkRequest, db: Session = De
             corrected_info=None,
             extracted_text=None,
         )
+
+
+@app.post("/api/follow-up", response_model=FollowUpResponse)
+def follow_up(
+    request: Request,
+    payload: FollowUpRequest,
+    db: Session = Depends(get_db),
+) -> FollowUpResponse:
+    if not get_authenticated_email(request):
+        raise HTTPException(status_code=401, detail={"requires_login": True})
+
+    try:
+        result = gemini_explainer.answer_follow_up(
+            query=payload.query,
+            previous_context=payload.previous_context,
+            history=payload.history,
+        )
+        return FollowUpResponse(
+            direct_answer=clean_response_text(result.get("direct_answer", "")),
+            explanation=[clean_response_text(x) for x in result.get("explanation", [])],
+            sources=result.get("sources"),
+            related_questions=[clean_response_text(x) for x in result.get("related_questions", [])],
+        )
+    except Exception as error:
+        logger.exception("Follow-up question answering failed")
+        raise HTTPException(status_code=503, detail="Follow-up answering is currently unavailable") from error
 
 
 @app.post("/api/feedback", response_model=FeedbackCreateResponse)
@@ -691,6 +733,10 @@ def predict_from_text(request: Request, text: str, db: Session) -> PredictRespon
         corrected_info=clean_response_text(explained.corrected_info) if explained.corrected_info else None,
         sources=explained.sources if explained.sources else None,
         grounded=explained.grounded,
+        is_ai_generated=explained.is_ai_generated,
+        mode=explained.mode,
+        direct_answer=clean_response_text(explained.direct_answer) if explained.direct_answer else None,
+        related_questions=[clean_response_text(q) for q in explained.related_questions] if explained.related_questions else [],
     )
 
 

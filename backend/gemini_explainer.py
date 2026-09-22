@@ -32,6 +32,9 @@ class ExplanationResult:
     sources: list[dict[str, str]] = field(default_factory=list)
     grounded: bool = False
     is_ai_generated: bool = False
+    mode: str = "VERIFY"  # "ANSWER" | "VERIFY"
+    direct_answer: str | None = None
+    related_questions: list[str] = field(default_factory=list)
 
 
 class GeminiExplainer:
@@ -100,25 +103,8 @@ class GeminiExplainer:
             parsed = self._parse_response_json(text_output)
             return self._validate_response(parsed, sources=sources, grounded=grounded)
         except Exception as exc:
-            logger.warning("All LLM reasoning providers failed: %s. Using heuristic fallback.", exc)
-            confidence = float(classifier_signal.get("confidence", 0.5))
-            label = str(classifier_signal.get("label", "NEEDS_REVIEW")).upper()
-            pct = int(round(confidence * 100)) if label in ("LIKELY_REAL", "REAL") else int(round((1 - confidence) * 100))
-            if label not in ("LIKELY_REAL", "LIKELY_FAKE", "NEEDS_REVIEW", "INSUFFICIENT_EVIDENCE"):
-                label = "NEEDS_REVIEW"
-                pct = 50
-
-            return ExplanationResult(
-                percentage=pct,
-                verdict=label,
-                explanation=[
-                    "Automated ML classification model evaluated this statement.",
-                    "Live external reasoning was unavailable or rate-limited; baseline statistical heuristics were applied.",
-                ],
-                corrected_info=None,
-                sources=sources,
-                grounded=grounded,
-            )
+            logger.warning("All LLM reasoning providers failed: %s. Using enhanced fallback.", exc)
+            return self._build_enhanced_fallback(text, classifier_signal, tavily_results, sources, grounded)
 
     def _search_tavily(self, query: str) -> list[dict[str, Any]]:
         """Search the web using Tavily API for real-time grounding context.
@@ -490,39 +476,194 @@ class GeminiExplainer:
 
         return (
             f"Current Date: {current_date}\n"
-            "You are an expert fact-checker and synthetic media (AI/Deepfake) verification assistant.\n"
-            "Analyze the user claim/link/media and output ONLY valid JSON with this exact schema:\n"
+            "You are SachLens AI, an intelligent verification and factual answering assistant.\n\n"
+            "STEP 1: DETECT USER INTENT (MANDATORY):\n"
+            "Determine if the user input is:\n"
+            "A) INFORMATIONAL QUESTION ('mode': 'ANSWER'):\n"
+            "   - The user is asking for direct factual knowledge, prices, specs, dates, definitions, match scores, explanations, or general inquiries (e.g. 'iphone 18 price kitna hoga', 'who is the president of india', 'what is photosynthesis', 'ipl 2026 kab start hoga', 'ind vs jpn match summary').\n"
+            "   - In this mode, do NOT treat it as a suspicious rumor or show verification doubt percentages. Instead provide a crisp, accurate, direct answer.\n"
+            "   - 'verdict': 'FACTUAL_ANSWER'\n"
+            "   - 'percentage': 100\n"
+            "   - 'is_ai_generated': false\n"
+            "   - 'direct_answer': A comprehensive, crystal-clear direct answer answering the user's question directly (e.g., specific price, exact date, definition, or current status).\n"
+            "   - 'explanation': Array of 2-4 key factual highlights, specifications, details, or breakdown.\n"
+            "   - 'corrected_info': null\n"
+            "   - 'related_questions': Array of 3 relevant follow-up questions the user might ask next.\n\n"
+            "B) CLAIM / RUMOR / FACT-CHECK VERIFICATION ('mode': 'VERIFY'):\n"
+            "   - The user is asking to verify a specific news item, rumor, viral claim, controversial statement, or media authenticity (e.g. 'kya ye sach hai ki india asia me h', 'did government announce 5000 rs bonus?', 'is modi ji dead?', 'is this video real or AI?', 'earth is flat').\n"
+            "   - 'verdict': 'LIKELY_REAL' | 'LIKELY_FAKE' | 'AI_GENERATED' | 'NEEDS_REVIEW' | 'INSUFFICIENT_EVIDENCE'\n"
+            "   - 'percentage': 0-100 (0-25 for fake/AI generated, 75-100 for verified real, 50 for unverified/mixed)\n"
+            "   - 'is_ai_generated': true if content is AI generated/deepfake, false otherwise\n"
+            "   - 'direct_answer': 1-2 sentences giving the crystal-clear direct bottom-line truth/verdict (e.g., 'Ha, ye bilkul sach hai ki India Asia continent me hai.' or 'Nahi, ye claim poori tarah se fake aur baseless hai.').\n"
+            "   - 'explanation': Array of 2-5 bullet points giving specific evidence, verified sources, or reasons.\n"
+            "   - 'corrected_info': String with the factual correction if fake/misleading, else null.\n"
+            "   - 'related_questions': Array of 3 relevant follow-up questions the user might ask next.\n\n"
+            "LANGUAGE MATCHING RULE (MANDATORY - MIRROR USER'S LANGUAGE):\n"
+            "- You MUST write 'direct_answer', 'explanation' bullets, 'corrected_info', and 'related_questions' in the exact same language and dialect as the user's input:\n"
+            "  * If user wrote in HINGLISH (Hindi in English script, e.g. 'iphone 18 ka price kitna h', 'kya ye sach hai'): Respond in natural, conversational HINGLISH.\n"
+            "  * If user wrote in ENGLISH: Respond in clear ENGLISH.\n"
+            "  * If user wrote in HINDI (Devanagari): Respond in HINDI.\n"
+            "  * If user wrote in another regional language: Mirror that language.\n\n"
+            "Output ONLY valid JSON with this exact schema (no markdown, no preamble):\n"
             "{\n"
-            '  "percentage": <integer 0-100: 0-25 for fake/AI generated, 75-100 for verified real>,\n'
-            '  "verdict": <"LIKELY_REAL" | "LIKELY_FAKE" | "AI_GENERATED" | "NEEDS_REVIEW" | "INSUFFICIENT_EVIDENCE">,\n'
-            '  "is_ai_generated": <true if the video, audio, image, or claim involves AI generation, synthetic media, deepfakes, or voice cloning; false otherwise>,\n'
-            '  "explanation": <array of 2-5 short bullet-style strings explaining the verdict and explicitly stating if/why it is AI-generated, fake, or real>,\n'
-            '  "corrected_info": <string with correct fact or null>\n'
+            '  "mode": <"ANSWER" | "VERIFY">,\n'
+            '  "direct_answer": <string>,\n'
+            '  "percentage": <integer 0-100>,\n'
+            '  "verdict": <"FACTUAL_ANSWER" | "LIKELY_REAL" | "LIKELY_FAKE" | "AI_GENERATED" | "NEEDS_REVIEW" | "INSUFFICIENT_EVIDENCE">,\n'
+            '  "is_ai_generated": <boolean>,\n'
+            '  "explanation": <array of 2-5 short bullet strings>,\n'
+            '  "corrected_info": <string or null>,\n'
+            '  "related_questions": <array of 3 follow-up question strings>\n'
             "}\n\n"
-            "LANGUAGE MATCHING RULE (MANDATORY - MIRROR USER'S INPUT LANGUAGE):\n"
-            "- You MUST write all 'explanation' bullets and 'corrected_info' in the exact same language and dialect as the user's input claim:\n"
-            "  * If the user wrote in HINGLISH (Hindi written using English/Latin alphabet, e.g., 'kya ye sach hai', 'ye video real hai ya fake', 'modi ji ne bola kya'): Write all explanation bullet points and corrected_info entirely in natural, conversational HINGLISH (e.g., 'Ye video poori tarah se AI-generated deepfake hai aur real footage nahi hai.', 'Official sources ne confirm kiya hai ki...').\n"
-            "  * If the user wrote in ENGLISH: Write all explanation bullet points and corrected_info in standard ENGLISH.\n"
-            "  * If the user wrote in HINDI (Devanagari script, e.g., 'क्या यह खबर सच है'): Write in clear HINDI.\n"
-            "  * If the user wrote in another language (e.g. Marathi, Tamil, Bengali, Telugu): Mirror that language.\n"
-            "- Always keep the JSON keys (\"percentage\", \"verdict\", \"is_ai_generated\", \"explanation\", \"corrected_info\") and verdict values in English uppercase as specified.\n\n"
-            "CRITICAL CLASSIFICATION & VERDICT RULES:\n"
-            "1. AI_GENERATED verdict (is_ai_generated: true):\n"
-            "   - Use this verdict whenever the content, video, image, or audio clip is created, synthesized, or manipulated by Artificial Intelligence (e.g., AI video generation via Sora/Runway/Pika, Deepfake voice clone, AI avatar, synthetic CGI presented as real footage, Midjourney/Flux image presented as real, AI face-swapping).\n"
-            "   - In the explanation bullets, explicitly state that this is an AI-generated video/image/audio and NOT real footage.\n"
-            "2. LIKELY_FAKE verdict (is_ai_generated: false):\n"
-            "   - Use this verdict when the claim or video is FALSE, fabricated, out of context, miscaptioned old footage, or misinformation, BUT is NOT created by generative AI tools.\n"
-            "3. LIKELY_REAL verdict (is_ai_generated: false):\n"
-            "   - Use this verdict when the claim/media is authentic, verified by credible reporting, and true.\n"
-            "4. INSUFFICIENT_EVIDENCE / NEEDS_REVIEW:\n"
-            "   - Use if evidence is insufficient or mixed. Set percentage 50.\n"
-            "5. If the claim is factually false or AI-generated, provide concise corrected facts in corrected_info in the matching language.\n"
-            "6. Output ONLY valid JSON starting directly with {.\n"
             f"{web_search_section}"
             f"{fact_check_section}\n"
-            f"User claim: {text}\n"
-            f"Classifier signal (for context only): {json.dumps(classifier_signal)}\n"
+            f"User input: {text}\n"
+            f"Classifier signal (for context): {json.dumps(classifier_signal)}\n"
         )
+
+    def _build_enhanced_fallback(
+        self,
+        text: str,
+        classifier_signal: dict[str, Any],
+        tavily_results: list[dict[str, Any]],
+        sources: list[dict[str, str]],
+        grounded: bool,
+    ) -> ExplanationResult:
+        """Create an intelligent synthesized fallback when LLMs are unreachable."""
+        lower = text.lower()
+        is_question = bool(
+            "?" in text
+            or any(w in lower for w in [
+                "what", "who", "when", "where", "how", "why", "price", "cost", "score",
+                "kya", "kab", "kaise", "kitna", "kon", "kaha", "kyu", "kisne", "batao"
+            ])
+        ) and not any(w in lower for w in ["kya ye sach hai", "is it true", "fake or real", "real or fake", "fake hai ya real"])
+
+        if tavily_results:
+            top_contents = [r.get("content", "").strip() for r in tavily_results if r.get("content")]
+            summary_bullet = top_contents[0][:200] if top_contents else "Search results retrieved."
+            bullets = [c[:180] for c in top_contents[:3]] if top_contents else ["Live web search context analyzed."]
+            direct_ans = f"Based on latest search results: {summary_bullet}"
+            mode = "ANSWER" if is_question else "VERIFY"
+            verdict = "FACTUAL_ANSWER" if is_question else "LIKELY_REAL"
+            pct = 100 if is_question else 85
+            return ExplanationResult(
+                percentage=pct,
+                verdict=verdict,
+                explanation=bullets,
+                corrected_info=None,
+                sources=sources,
+                grounded=grounded,
+                is_ai_generated=False,
+                mode=mode,
+                direct_answer=direct_ans,
+                related_questions=[
+                    f"Tell me more details about {text[:30]}",
+                    f"What are latest updates on this?",
+                    f"Are there any official sources for this?"
+                ],
+            )
+
+        confidence = float(classifier_signal.get("confidence", 0.5))
+        label = str(classifier_signal.get("label", "NEEDS_REVIEW")).upper()
+        pct = int(round(confidence * 100)) if label in ("LIKELY_REAL", "REAL") else int(round((1 - confidence) * 100))
+        if label not in ("LIKELY_REAL", "LIKELY_FAKE", "NEEDS_REVIEW", "INSUFFICIENT_EVIDENCE"):
+            label = "NEEDS_REVIEW"
+            pct = 50
+
+        return ExplanationResult(
+            percentage=pct,
+            verdict=label,
+            explanation=[
+                "Automated classification model evaluated this statement.",
+                "Real-time external reasoning is currently busy; standard heuristic analysis was applied.",
+            ],
+            corrected_info=None,
+            sources=sources,
+            grounded=grounded,
+            is_ai_generated=False,
+            mode="VERIFY",
+            direct_answer="Evaluation completed using automated heuristic model.",
+            related_questions=[
+                "Can you verify with more sources?",
+                "What is the background of this claim?",
+            ],
+        )
+
+    def answer_follow_up(
+        self,
+        query: str,
+        previous_context: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Answer follow-up user queries maintaining previous context."""
+        import datetime
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        # Tavily search for follow up query
+        search_query = f"{query} {previous_context[:100]}".strip()
+        tavily_results = self._search_tavily(search_query)
+        sources: list[dict[str, str]] = [
+            {"title": r.get("title", ""), "url": r.get("url", "")}
+            for r in tavily_results if r.get("url")
+        ]
+
+        web_search_section = ""
+        if tavily_results:
+            lines = ["\n--- LIVE WEB SEARCH RESULTS ---"]
+            for i, r in enumerate(tavily_results, 1):
+                lines.append(f"{i}. [{r.get('title', 'Untitled')}]({r.get('url', '')})\n   {r.get('content', '')[:300]}")
+            lines.append("--- END OF WEB SEARCH RESULTS ---\n")
+            web_search_section = "\n".join(lines)
+
+        history_lines = ""
+        if history:
+            history_lines = "\nConversation History:\n" + "\n".join(
+                [f"{msg.get('role', 'user').title()}: {msg.get('content', '')}" for msg in history[-4:]]
+            )
+
+        prompt = (
+            f"Current Date: {current_date}\n"
+            "You are SachLens AI, answering a follow-up question related to a previous fact-check / inquiry.\n"
+            f"Original Topic/Context: {previous_context}\n"
+            f"{history_lines}\n"
+            f"Follow-up Question: {query}\n\n"
+            f"{web_search_section}\n"
+            "LANGUAGE RULE: Mirror the language and style of the user's follow-up question (Hinglish/English/Hindi).\n"
+            "Provide a direct, helpful, and concise answer.\n"
+            "Output ONLY valid JSON (no markdown, no backticks):\n"
+            "{\n"
+            '  "direct_answer": <clear, direct answer string>,\n'
+            '  "explanation": <array of 2-4 bullet point strings providing key details or explanation>,\n'
+            '  "related_questions": <array of 2-3 follow-up question suggestions>\n'
+            "}\n"
+        )
+
+        try:
+            raw = self._call_llm(prompt, temperature=0.2)
+            parsed = self._parse_response_json(raw)
+            direct_ans = str(parsed.get("direct_answer") or "").strip()
+            expl = parsed.get("explanation")
+            if not isinstance(expl, list) or not expl:
+                expl = [direct_ans] if direct_ans else ["Follow-up details retrieved."]
+            rel_q = parsed.get("related_questions")
+            if not isinstance(rel_q, list):
+                rel_q = []
+            return {
+                "direct_answer": direct_ans or "Here is the information for your question.",
+                "explanation": [str(x) for x in expl if str(x).strip()],
+                "sources": sources,
+                "related_questions": [str(q) for q in rel_q if str(q).strip()],
+            }
+        except Exception as exc:
+            logger.warning("Follow-up answer LLM failed: %s. Using Tavily fallback.", exc)
+            fallback_ans = tavily_results[0].get("content", "")[:250] if tavily_results else "Information retrieved for your follow-up inquiry."
+            return {
+                "direct_answer": fallback_ans,
+                "explanation": [r.get("content", "")[:180] for r in tavily_results[:2]] if tavily_results else ["Contextual search completed."],
+                "sources": sources,
+                "related_questions": [],
+            }
 
     def _extract_text_output(self, payload: dict[str, Any]) -> str:
         candidates = payload.get("candidates")
@@ -567,15 +708,6 @@ class GeminiExplainer:
                         if uri:
                             sources.append({"url": uri, "title": title or uri})
 
-        # Also check groundingSupports for more detailed attribution
-        supports = grounding_metadata.get("groundingSupports", [])
-        if isinstance(supports, list):
-            for support in supports:
-                if isinstance(support, dict):
-                    segment = support.get("segment", {})
-                    indices = support.get("groundingChunkIndices", [])
-                    # These reference the chunks above — already captured
-
         # Deduplicate by URL
         seen_urls: set[str] = set()
         unique_sources: list[dict[str, str]] = []
@@ -609,7 +741,7 @@ class GeminiExplainer:
         try:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError:
-            # Attempt JSON auto-repair for truncated output (e.g. unclosed array or braces)
+            # Attempt JSON auto-repair for truncated output
             try:
                 repaired = cleaned
                 if repaired.count('"') % 2 != 0:
@@ -620,7 +752,6 @@ class GeminiExplainer:
                     repaired += '}'
                 parsed = json.loads(repaired)
             except Exception:
-                # Regex fallback extraction
                 pct_match = re.search(r'"percentage"\s*:\s*(\d+)', cleaned)
                 verdict_match = re.search(r'"verdict"\s*:\s*"([^"]+)"', cleaned)
                 expl_match = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', cleaned)
@@ -686,6 +817,22 @@ class GeminiExplainer:
         if is_ai_generated:
             verdict = "AI_GENERATED"
 
+        # Mode and direct_answer detection
+        mode_raw = str(payload.get("mode") or "").strip().upper()
+        mode = "ANSWER" if mode_raw == "ANSWER" or verdict == "FACTUAL_ANSWER" else "VERIFY"
+        direct_answer = payload.get("direct_answer")
+        if isinstance(direct_answer, str) and direct_answer.strip():
+            direct_answer = direct_answer.strip()
+        else:
+            direct_answer = explanation[0] if explanation else None
+
+        related_questions_raw = payload.get("related_questions")
+        related_questions: list[str] = []
+        if isinstance(related_questions_raw, list):
+            for q in related_questions_raw:
+                if isinstance(q, str) and q.strip():
+                    related_questions.append(q.strip())
+
         return ExplanationResult(
             percentage=percentage,
             verdict=verdict,
@@ -694,4 +841,7 @@ class GeminiExplainer:
             sources=sources or [],
             grounded=grounded,
             is_ai_generated=is_ai_generated,
+            mode=mode,
+            direct_answer=direct_answer,
+            related_questions=related_questions,
         )

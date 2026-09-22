@@ -28,6 +28,9 @@ function App() {
   const [recordingSeconds, setRecordingSeconds] = useState(0)
   const [tabResults, setTabResults] = useState({ text: null, image: null, voice: null, link: null })
   const [tabLoading, setTabLoading] = useState({ text: false, image: false, voice: false, link: false })
+  const [followUpInputs, setFollowUpInputs] = useState({ text: '', image: '', voice: '', link: '' })
+  const [followUpThreads, setFollowUpThreads] = useState({ text: [], image: [], voice: [], link: [] })
+  const [followUpLoading, setFollowUpLoading] = useState({ text: false, image: false, voice: false, link: false })
   const analysisResult = tabResults[activeTab]
   const isAnalyzing = tabLoading[activeTab]
   const [showLoginPrompt, setShowLoginPrompt] = useState(false)
@@ -698,6 +701,8 @@ function App() {
   async function analyzeText(text) {
     setTabLoading((prev) => ({ ...prev, text: true }))
     setTabResults((prev) => ({ ...prev, text: null }))
+    setFollowUpThreads((prev) => ({ ...prev, text: [] }))
+    setFollowUpInputs((prev) => ({ ...prev, text: '' }))
 
     if (!accessToken) {
       setShowLoginPrompt(true)
@@ -745,6 +750,8 @@ function App() {
   async function analyzeImage(file, context) {
     setTabLoading((prev) => ({ ...prev, image: true }))
     setTabResults((prev) => ({ ...prev, image: null }))
+    setFollowUpThreads((prev) => ({ ...prev, image: [] }))
+    setFollowUpInputs((prev) => ({ ...prev, image: '' }))
 
     if (!accessToken) {
       setShowLoginPrompt(true)
@@ -789,6 +796,8 @@ function App() {
   async function analyzeVoice(blob) {
     setTabLoading((prev) => ({ ...prev, voice: true }))
     setTabResults((prev) => ({ ...prev, voice: null }))
+    setFollowUpThreads((prev) => ({ ...prev, voice: [] }))
+    setFollowUpInputs((prev) => ({ ...prev, voice: '' }))
 
     if (!accessToken) {
       setShowLoginPrompt(true)
@@ -830,6 +839,8 @@ function App() {
   async function analyzeLink(url, context) {
     setTabLoading((prev) => ({ ...prev, link: true }))
     setTabResults((prev) => ({ ...prev, link: null }))
+    setFollowUpThreads((prev) => ({ ...prev, link: [] }))
+    setFollowUpInputs((prev) => ({ ...prev, link: '' }))
 
     if (!accessToken) {
       setShowLoginPrompt(true)
@@ -862,6 +873,81 @@ function App() {
       setTabResults((prev) => ({ ...prev, link: formatErrorResult(error.message) }))
     } finally {
       setTabLoading((prev) => ({ ...prev, link: false }))
+    }
+  }
+
+  async function handleAskFollowUp(tab, customQuery) {
+    const query = (customQuery || followUpInputs[tab] || '').trim()
+    if (!query || followUpLoading[tab]) return
+
+    if (!accessToken) {
+      setShowLoginPrompt(true)
+      setAuthError('Sign in to ask follow-up questions.')
+      return
+    }
+
+    let prevContext = ''
+    if (tab === 'text') prevContext = textValue
+    else if (tab === 'image') prevContext = `Image text: ${tabResults[tab]?.extracted_text || ''} Context: ${imageContext}`
+    else if (tab === 'voice') prevContext = `Voice transcript: ${tabResults[tab]?.transcript || ''}`
+    else if (tab === 'link') prevContext = `Link: ${linkValue} Context: ${linkContext}`
+
+    const currentResult = tabResults[tab]
+    if (currentResult?.directAnswer) {
+      prevContext += `\nPrevious Answer: ${currentResult.directAnswer}`
+    }
+
+    const userMsg = { role: 'user', content: query }
+    setFollowUpThreads((prev) => ({
+      ...prev,
+      [tab]: [...(prev[tab] || []), userMsg],
+    }))
+    setFollowUpInputs((prev) => ({ ...prev, [tab]: '' }))
+    setFollowUpLoading((prev) => ({ ...prev, [tab]: true }))
+
+    try {
+      const history = (followUpThreads[tab] || []).map((m) => ({ role: m.role, content: m.content }))
+      const response = await fetch(`${API_BASE_URL}/api/follow-up`, {
+        method: 'POST',
+        headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+        credentials: 'include',
+        body: JSON.stringify({
+          query,
+          previous_context: prevContext || query,
+          history,
+        }),
+      })
+      const payload = await readJsonResponse(response)
+      if (!response.ok) {
+        throw new Error(formatApiError(payload, 'Could not get follow-up answer.'))
+      }
+
+      const assistantMsg = {
+        role: 'assistant',
+        content: payload.direct_answer,
+        explanation: payload.explanation || [],
+        sources: payload.sources || [],
+        relatedQuestions: payload.related_questions || [],
+      }
+
+      setFollowUpThreads((prev) => ({
+        ...prev,
+        [tab]: [...(prev[tab] || []), assistantMsg],
+      }))
+    } catch (err) {
+      const errorMsg = {
+        role: 'assistant',
+        content: 'Could not fetch an answer at the moment. Please try again.',
+        explanation: [err.message || 'Network or reasoning issue.'],
+        sources: [],
+        relatedQuestions: [],
+      }
+      setFollowUpThreads((prev) => ({
+        ...prev,
+        [tab]: [...(prev[tab] || []), errorMsg],
+      }))
+    } finally {
+      setFollowUpLoading((prev) => ({ ...prev, [tab]: false }))
     }
   }
 
@@ -1287,108 +1373,323 @@ function App() {
                   </button>
 
                   {analysisResult && (
-                    <div className={`border p-5 sm:p-6 ${
-                      analysisResult.isAiGenerated
-                        ? 'border-purple-500/30 bg-purple-50/50 dark:border-purple-400/20 dark:bg-purple-950/20'
-                        : analysisResult.isInsufficientEvidence
-                          ? 'border-amber-500/30 bg-amber-50/50 dark:border-amber-400/20 dark:bg-amber-950/20'
-                          : 'border-black/15 bg-[#fbfbf8] dark:border-white/15 dark:bg-[#0d0d0d]'
-                    }`}>
-                      <div className="flex flex-wrap items-end justify-between gap-4">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-xs font-bold uppercase tracking-[0.28em] text-black/45 dark:text-white/45">RESULT</span>
-                            {analysisResult.isAiGenerated && (
-                              <span className="inline-flex items-center gap-1 border border-purple-500/40 bg-purple-500/10 px-2 py-0.5 font-mono text-[0.65rem] font-black uppercase tracking-wider text-purple-700 dark:border-purple-400/30 dark:bg-purple-950/50 dark:text-purple-300">
-                                🤖 AI GENERATED / DEEPFAKE
+                    <div className="space-y-4">
+                      {/* MODE A: INFORMATIONAL QUESTION (DIRECT ANSWER) */}
+                      {analysisResult.mode === 'ANSWER' ? (
+                        <div className="border border-blue-500/30 bg-blue-50/40 p-5 sm:p-6 dark:border-blue-400/20 dark:bg-blue-950/20">
+                          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-blue-500/20 pb-3.5 dark:border-blue-400/20">
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-xs font-bold uppercase tracking-[0.28em] text-blue-700 dark:text-blue-300">
+                                💡 DIRECT ANSWER
                               </span>
+                            </div>
+                            <span className="inline-flex items-center border border-blue-500/30 bg-blue-500/10 px-2.5 py-1 font-mono text-[0.68rem] font-bold uppercase tracking-wider text-blue-700 dark:border-blue-400/30 dark:bg-blue-950/50 dark:text-blue-300">
+                              ✓ Factually Answered
+                            </span>
+                          </div>
+
+                          {/* Direct Answer Box */}
+                          <div className="mt-4 border-l-4 border-blue-600 bg-white p-4 shadow-sm dark:border-blue-400 dark:bg-[#111111]">
+                            <div className="font-sans text-base sm:text-lg font-semibold leading-relaxed text-black dark:text-white">
+                              {analysisResult.directAnswer || analysisResult.reasons?.[0]}
+                            </div>
+                          </div>
+
+                          {/* Key Details & Highlights */}
+                          {analysisResult.reasons && analysisResult.reasons.length > 0 && (
+                            <div className="mt-4">
+                              <div className="font-mono text-[0.68rem] font-bold uppercase tracking-[0.24em] text-black/50 dark:text-white/50 mb-2">
+                                Key Details & Highlights
+                              </div>
+                              <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                                {analysisResult.reasons.map((reason, idx) => (
+                                  <div key={idx} className="border border-black/10 bg-white/80 p-3 font-sans text-sm leading-relaxed text-black/75 dark:border-white/10 dark:bg-[#111111]/80 dark:text-white/75">
+                                    • {reason}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Sources */}
+                          {analysisResult.sources && analysisResult.sources.length > 0 && (
+                            <div className="mt-4 border border-emerald-600/20 bg-emerald-50/40 p-3 dark:border-emerald-400/15 dark:bg-emerald-950/20">
+                              <div className="font-mono text-[0.65rem] font-bold uppercase tracking-[0.24em] text-emerald-700 dark:text-emerald-400">
+                                Verified Sources
+                              </div>
+                              <div className="mt-2 space-y-1">
+                                {analysisResult.sources.map((src, i) => (
+                                  <a
+                                    key={i}
+                                    href={src.url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="block break-all font-sans text-xs text-emerald-700 underline decoration-emerald-600/30 transition-colors hover:text-emerald-900 dark:text-emerald-400 dark:decoration-emerald-400/30 dark:hover:text-emerald-300"
+                                  >
+                                    {src.title || src.url}
+                                  </a>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Dynamic disclaimer */}
+                          <div className={`mt-3 border p-2.5 font-sans text-xs uppercase tracking-[0.18em] ${
+                            analysisResult.grounded
+                              ? 'border-emerald-600/15 bg-emerald-50/30 text-emerald-700/80 dark:border-emerald-400/10 dark:bg-emerald-950/15 dark:text-emerald-400/70'
+                              : 'border-black/10 bg-[#f9f5f0] text-black/60 dark:border-white/10 dark:bg-[#0f0f0f] dark:text-white/60'
+                          }`}>
+                            {analysisResult.grounded
+                              ? '✓ Verified with live web sources'
+                              : 'Based on general knowledge, not live-checked.'}
+                          </div>
+
+                          {analysisResult.extracted_text && (
+                            <div className="mt-3">
+                              <details className="rounded border border-black/10 bg-white p-3 dark:border-white/10 dark:bg-[#111111]">
+                                <summary className="font-mono text-xs font-bold uppercase tracking-[0.24em] text-black/55 dark:text-white/55">OCR: extracted text</summary>
+                                <pre className="mt-2 whitespace-pre-wrap font-sans text-sm text-black/70 dark:text-white/70">{analysisResult.extracted_text}</pre>
+                              </details>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        /* MODE B: CLAIM / FACT-CHECK VERIFICATION */
+                        <div className={`border p-5 sm:p-6 ${
+                          analysisResult.isAiGenerated
+                            ? 'border-purple-500/30 bg-purple-50/50 dark:border-purple-400/20 dark:bg-purple-950/20'
+                            : analysisResult.isInsufficientEvidence
+                              ? 'border-amber-500/30 bg-amber-50/50 dark:border-amber-400/20 dark:bg-amber-950/20'
+                              : 'border-black/15 bg-[#fbfbf8] dark:border-white/15 dark:bg-[#0d0d0d]'
+                        }`}>
+                          <div className="flex flex-wrap items-end justify-between gap-4">
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-xs font-bold uppercase tracking-[0.28em] text-black/45 dark:text-white/45">RESULT</span>
+                                {analysisResult.isAiGenerated && (
+                                  <span className="inline-flex items-center gap-1 border border-purple-500/40 bg-purple-500/10 px-2 py-0.5 font-mono text-[0.65rem] font-black uppercase tracking-wider text-purple-700 dark:border-purple-400/30 dark:bg-purple-950/50 dark:text-purple-300">
+                                    🤖 AI GENERATED / DEEPFAKE
+                                  </span>
+                                )}
+                              </div>
+                              <div className={`mt-2 text-3xl font-black uppercase tracking-tight ${
+                                analysisResult.isAiGenerated
+                                  ? 'text-purple-700 dark:text-purple-400'
+                                  : analysisResult.isInsufficientEvidence
+                                    ? 'text-amber-600 dark:text-amber-400'
+                                    : 'text-black dark:text-white'
+                              }`}>
+                                {analysisResult.isAiGenerated ? 'AI GENERATED MEDIA' : analysisResult.isInsufficientEvidence ? 'INSUFFICIENT EVIDENCE' : analysisResult.verdict}
+                              </div>
+                              {analysisResult.isAiGenerated && (
+                                <div className="mt-1 font-sans text-sm font-medium text-purple-700/90 dark:text-purple-300/80">
+                                  ⚠️ Synthetic / Deepfake media detected: This video or image was generated using AI tools and is not authentic real footage.
+                                </div>
+                              )}
+                              {analysisResult.isInsufficientEvidence && (
+                                <div className="mt-1 font-sans text-sm text-amber-700/80 dark:text-amber-300/70">
+                                  We couldn't confidently verify this claim — here's what we found
+                                </div>
+                              )}
+                            </div>
+                            <div className={`font-mono text-5xl font-black uppercase tracking-tight ${
+                              analysisResult.isAiGenerated
+                                ? 'text-purple-600 dark:text-purple-400'
+                                : analysisResult.isInsufficientEvidence
+                                  ? 'text-amber-500/70 dark:text-amber-400/60'
+                                  : analysisResult.verdict?.toUpperCase()?.includes('REAL')
+                                    ? 'text-emerald-600 dark:text-emerald-400'
+                                    : 'text-[#ef4444]'
+                            }`}>
+                              {analysisResult.score}
+                            </div>
+                          </div>
+
+                          {/* Direct Verdict Summary */}
+                          {analysisResult.directAnswer && (
+                            <div className="mt-4 border-l-4 border-black/70 bg-white p-3.5 shadow-sm dark:border-white/70 dark:bg-[#111111]">
+                              <div className="font-sans text-sm sm:text-base font-semibold text-black dark:text-white">
+                                {analysisResult.directAnswer}
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-2">
+                            {analysisResult.reasons.map((reason, idx) => (
+                              <div key={idx} className="border border-black/10 bg-white p-3 font-sans text-sm leading-relaxed text-black/70 dark:border-white/10 dark:bg-[#111111] dark:text-white/70">
+                                {reason}
+                              </div>
+                            ))}
+
+                            {analysisResult.corrected_info && (
+                              <div className="col-span-1 md:col-span-2 border border-[#ef4444]/35 bg-white p-3 font-sans text-sm text-black/80 dark:bg-[#111111] dark:text-white/80">
+                                <div className="font-mono text-[0.65rem] font-bold uppercase tracking-[0.24em] text-[#ef4444]">Corrected info</div>
+                                <div className="mt-1">{analysisResult.corrected_info}</div>
+                              </div>
+                            )}
+
+                            {/* Sources */}
+                            {analysisResult.sources && analysisResult.sources.length > 0 && (
+                              <div className="col-span-1 md:col-span-2 border border-emerald-600/20 bg-emerald-50/40 p-3 dark:border-emerald-400/15 dark:bg-emerald-950/20">
+                                <div className="font-mono text-[0.65rem] font-bold uppercase tracking-[0.24em] text-emerald-700 dark:text-emerald-400">Sources used</div>
+                                <div className="mt-2 space-y-1">
+                                  {analysisResult.sources.map((src, i) => (
+                                    <a
+                                      key={i}
+                                      href={src.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="block break-all font-sans text-xs text-emerald-700 underline decoration-emerald-600/30 transition-colors hover:text-emerald-900 dark:text-emerald-400 dark:decoration-emerald-400/30 dark:hover:text-emerald-300"
+                                    >
+                                      {src.title || src.url}
+                                    </a>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Dynamic disclaimer */}
+                            <div className={`col-span-1 md:col-span-2 border p-3 font-sans text-xs uppercase tracking-[0.18em] ${
+                              analysisResult.grounded
+                                ? 'border-emerald-600/15 bg-emerald-50/30 text-emerald-700/80 dark:border-emerald-400/10 dark:bg-emerald-950/15 dark:text-emerald-400/70'
+                                : 'border-black/10 bg-[#f9f5f0] text-black/60 dark:border-white/10 dark:bg-[#0f0f0f] dark:text-white/60'
+                            }`}>
+                              {analysisResult.grounded
+                                ? '✓ Verified with live web sources'
+                                : 'Based on general knowledge, not live-checked.'}
+                            </div>
+
+                            {analysisResult.extracted_text && (
+                              <div className="col-span-1 md:col-span-2 mt-3">
+                                <details className="rounded border border-black/10 bg-white p-3 dark:border-white/10 dark:bg-[#111111]">
+                                  <summary className="font-mono text-xs font-bold uppercase tracking-[0.24em] text-black/55 dark:text-white/55">OCR: extracted text</summary>
+                                  <pre className="mt-2 whitespace-pre-wrap font-sans text-sm text-black/70 dark:text-white/70">{analysisResult.extracted_text}</pre>
+                                </details>
+                              </div>
                             )}
                           </div>
-                          <div className={`mt-2 text-3xl font-black uppercase tracking-tight ${
-                            analysisResult.isAiGenerated
-                              ? 'text-purple-700 dark:text-purple-400'
-                              : analysisResult.isInsufficientEvidence
-                                ? 'text-amber-600 dark:text-amber-400'
-                                : 'text-black dark:text-white'
-                          }`}>
-                            {analysisResult.isAiGenerated ? 'AI GENERATED MEDIA' : analysisResult.isInsufficientEvidence ? 'INSUFFICIENT EVIDENCE' : analysisResult.verdict}
-                          </div>
-                          {analysisResult.isAiGenerated && (
-                            <div className="mt-1 font-sans text-sm font-medium text-purple-700/90 dark:text-purple-300/80">
-                              ⚠️ Synthetic / Deepfake media detected: This video or image was generated using AI tools and is not authentic real footage.
-                            </div>
-                          )}
-                          {analysisResult.isInsufficientEvidence && (
-                            <div className="mt-1 font-sans text-sm text-amber-700/80 dark:text-amber-300/70">
-                              We couldn't confidently verify this claim — here's what we found
-                            </div>
-                          )}
                         </div>
-                        <div className={`font-mono text-5xl font-black uppercase tracking-tight ${
-                          analysisResult.isAiGenerated
-                            ? 'text-purple-600 dark:text-purple-400'
-                            : analysisResult.isInsufficientEvidence
-                              ? 'text-amber-500/70 dark:text-amber-400/60'
-                              : analysisResult.verdict?.toUpperCase()?.includes('REAL')
-                                ? 'text-emerald-600 dark:text-emerald-400'
-                                : 'text-[#ef4444]'
-                        }`}>
-                          {analysisResult.score}
-                        </div>
-                      </div>
-                      <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-2">
-                        {analysisResult.reasons.map((reason) => (
-                          <div key={reason} className="border border-black/10 bg-white p-3 font-sans text-sm leading-relaxed text-black/70 dark:border-white/10 dark:bg-[#111111] dark:text-white/70">
-                            {reason}
-                          </div>
-                        ))}
+                      )}
 
-                        {analysisResult.corrected_info && (
-                          <div className="col-span-1 md:col-span-2 border border-[#ef4444]/35 bg-white p-3 font-sans text-sm text-black/80 dark:bg-[#111111] dark:text-white/80">
-                            <div className="font-mono text-[0.65rem] font-bold uppercase tracking-[0.24em] text-[#ef4444]">Corrected info</div>
-                            <div className="mt-1">{analysisResult.corrected_info}</div>
+                      {/* INTERACTIVE FOLLOW-UP Q&A (Available on all tabs) */}
+                      <div className="border border-black/15 bg-[#fbfbf8] p-4 sm:p-5 dark:border-white/15 dark:bg-[#0e0e0e]">
+                        <div className="flex items-center justify-between gap-2 border-b border-black/10 pb-3 dark:border-white/10">
+                          <div className="flex items-center gap-2 font-mono text-xs font-bold uppercase tracking-[0.24em] text-black/70 dark:text-white/70">
+                            <span>💬</span>
+                            <span>Ask Follow-up Questions</span>
+                          </div>
+                          <span className="font-mono text-[0.65rem] text-black/40 dark:text-white/40">
+                            Context-Aware AI
+                          </span>
+                        </div>
+
+                        {/* Suggested Quick Questions */}
+                        {(() => {
+                          const currentThread = followUpThreads[activeTab] || []
+                          const lastFollowUp = currentThread[currentThread.length - 1]
+                          const suggestions = (lastFollowUp?.relatedQuestions && lastFollowUp.relatedQuestions.length > 0)
+                            ? lastFollowUp.relatedQuestions
+                            : (analysisResult.relatedQuestions || [])
+
+                          if (!suggestions || suggestions.length === 0) return null
+                          return (
+                            <div className="mt-3">
+                              <div className="font-mono text-[0.65rem] font-semibold uppercase tracking-wider text-black/45 dark:text-white/45 mb-1.5">
+                                Suggested questions:
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                {suggestions.map((q, idx) => (
+                                  <button
+                                    key={idx}
+                                    type="button"
+                                    onClick={() => handleAskFollowUp(activeTab, q)}
+                                    disabled={followUpLoading[activeTab]}
+                                    className="border border-black/20 bg-white px-2.5 py-1 text-left font-sans text-xs text-black/80 shadow-sm transition hover:border-black hover:bg-black/5 disabled:opacity-50 dark:border-white/20 dark:bg-[#1a1a1a] dark:text-white/80 dark:hover:border-white dark:hover:bg-white/5"
+                                  >
+                                    ⚡ {q}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )
+                        })()}
+
+                        {/* Follow-up conversation history */}
+                        {followUpThreads[activeTab] && followUpThreads[activeTab].length > 0 && (
+                          <div className="mt-4 space-y-3">
+                            {followUpThreads[activeTab].map((msg, idx) => (
+                              <div
+                                key={idx}
+                                className={`p-3.5 ${
+                                  msg.role === 'user'
+                                    ? 'border-l-4 border-black bg-black/5 dark:border-white dark:bg-white/5 font-sans text-sm font-medium text-black dark:text-white'
+                                    : 'border border-black/10 bg-white dark:border-white/10 dark:bg-[#141414]'
+                                }`}
+                              >
+                                {msg.role === 'user' ? (
+                                  <div className="flex items-start gap-2">
+                                    <span className="font-mono text-[0.7rem] font-bold uppercase tracking-wider text-black/50 dark:text-white/50">You:</span>
+                                    <span>{msg.content}</span>
+                                  </div>
+                                ) : (
+                                  <div className="space-y-2">
+                                    <div className="font-mono text-[0.65rem] font-bold uppercase tracking-[0.24em] text-blue-600 dark:text-blue-400">
+                                      SachLens Response
+                                    </div>
+                                    <div className="font-sans text-sm font-semibold leading-relaxed text-black dark:text-white">
+                                      {msg.content}
+                                    </div>
+                                    {msg.explanation && msg.explanation.length > 0 && (
+                                      <div className="space-y-1 pt-1 border-t border-black/5 dark:border-white/5">
+                                        {msg.explanation.map((item, i) => (
+                                          <div key={i} className="font-sans text-xs text-black/70 dark:text-white/70">
+                                            • {item}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                    {msg.sources && msg.sources.length > 0 && (
+                                      <div className="pt-2">
+                                        <div className="font-mono text-[0.6rem] uppercase tracking-wider text-emerald-600 dark:text-emerald-400">Sources:</div>
+                                        {msg.sources.map((s, i) => (
+                                          <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" className="block text-[0.7rem] text-emerald-700 dark:text-emerald-400 underline truncate">
+                                            {s.title || s.url}
+                                          </a>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
                           </div>
                         )}
 
-                        {/* Sources */}
-                        {analysisResult.sources && analysisResult.sources.length > 0 && (
-                          <div className="col-span-1 md:col-span-2 border border-emerald-600/20 bg-emerald-50/40 p-3 dark:border-emerald-400/15 dark:bg-emerald-950/20">
-                            <div className="font-mono text-[0.65rem] font-bold uppercase tracking-[0.24em] text-emerald-700 dark:text-emerald-400">Sources used</div>
-                            <div className="mt-2 space-y-1">
-                              {analysisResult.sources.map((src, i) => (
-                                <a
-                                  key={i}
-                                  href={src.url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="block break-all font-sans text-xs text-emerald-700 underline decoration-emerald-600/30 transition-colors hover:text-emerald-900 dark:text-emerald-400 dark:decoration-emerald-400/30 dark:hover:text-emerald-300"
-                                >
-                                  {src.title || src.url}
-                                </a>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Dynamic disclaimer */}
-                        <div className={`col-span-1 md:col-span-2 border p-3 font-sans text-xs uppercase tracking-[0.18em] ${
-                          analysisResult.grounded
-                            ? 'border-emerald-600/15 bg-emerald-50/30 text-emerald-700/80 dark:border-emerald-400/10 dark:bg-emerald-950/15 dark:text-emerald-400/70'
-                            : 'border-black/10 bg-[#f9f5f0] text-black/60 dark:border-white/10 dark:bg-[#0f0f0f] dark:text-white/60'
-                        }`}>
-                          {analysisResult.grounded
-                            ? '✓ Verified with live web sources'
-                            : 'Based on general knowledge, not live-checked.'}
+                        {/* Follow-up input form */}
+                        <div className="mt-4 flex gap-2">
+                          <input
+                            type="text"
+                            value={followUpInputs[activeTab] || ''}
+                            onChange={(e) => setFollowUpInputs(prev => ({ ...prev, [activeTab]: e.target.value }))}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault()
+                                handleAskFollowUp(activeTab)
+                              }
+                            }}
+                            placeholder="Ask further question or explore more..."
+                            disabled={followUpLoading[activeTab]}
+                            className="flex-1 border border-black/20 bg-white px-3 py-2 font-sans text-sm text-black placeholder-black/35 focus:border-black focus:outline-none dark:border-white/20 dark:bg-[#111111] dark:text-white dark:placeholder-white/35 dark:focus:border-white"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleAskFollowUp(activeTab)}
+                            disabled={followUpLoading[activeTab] || !(followUpInputs[activeTab] || '').trim()}
+                            className="border border-black bg-black px-4 py-2 font-mono text-xs font-bold uppercase tracking-wider text-white transition hover:bg-[#222] disabled:cursor-not-allowed disabled:border-black/20 disabled:bg-black/20 dark:border-white dark:bg-white dark:text-black dark:hover:bg-[#ddd] dark:disabled:border-white/20 dark:disabled:bg-white/20"
+                          >
+                            {followUpLoading[activeTab] ? '...' : 'ASK'}
+                          </button>
                         </div>
-
-                        {analysisResult.extracted_text && (
-                          <div className="col-span-1 md:col-span-2 mt-3">
-                            <details className="rounded border border-black/10 bg-white p-3 dark:border-white/10 dark:bg-[#111111]">
-                              <summary className="font-mono text-xs font-bold uppercase tracking-[0.24em] text-black/55 dark:text-white/55">OCR: extracted text</summary>
-                              <pre className="mt-2 whitespace-pre-wrap font-sans text-sm text-black/70 dark:text-white/70">{analysisResult.extracted_text}</pre>
-                            </details>
-                          </div>
-                        )}
                       </div>
                     </div>
                   )}
@@ -2012,9 +2313,14 @@ function formatPredictionResult(prediction) {
       verdictText = 'AI GENERATED'
     }
     const isInsufficient = verdictText.toUpperCase() === 'INSUFFICIENT EVIDENCE'
+    const mode = String(prediction.mode || '').toUpperCase() === 'ANSWER' || verdictText.toUpperCase().includes('ANSWER') ? 'ANSWER' : 'VERIFY'
+    const directAnswer = typeof prediction.direct_answer === 'string' && prediction.direct_answer.trim()
+      ? prediction.direct_answer.trim()
+      : (prediction.explanation?.[0] || null)
+
     return {
-      verdict: verdictText || 'NEEDS REVIEW',
-      score: isInsufficient ? '—' : `${safePercentage}%`,
+      verdict: verdictText || (mode === 'ANSWER' ? 'FACTUAL ANSWER' : 'NEEDS REVIEW'),
+      score: mode === 'ANSWER' ? '100%' : (isInsufficient ? '—' : `${safePercentage}%`),
       reasons: prediction.explanation.map((item) => String(item)),
       corrected_info:
         typeof prediction.corrected_info === 'string' && prediction.corrected_info.trim()
@@ -2036,6 +2342,9 @@ function formatPredictionResult(prediction) {
       grounded: !!prediction.grounded,
       isInsufficientEvidence: isInsufficient,
       isAiGenerated: isAi,
+      mode,
+      directAnswer,
+      relatedQuestions: Array.isArray(prediction.related_questions) ? prediction.related_questions : [],
     }
   }
 
@@ -2054,6 +2363,9 @@ function formatPredictionResult(prediction) {
     sources: [],
     grounded: false,
     isInsufficientEvidence: false,
+    mode: 'VERIFY',
+    directAnswer: null,
+    relatedQuestions: [],
   }
 }
 
