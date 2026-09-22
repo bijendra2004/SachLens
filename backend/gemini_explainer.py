@@ -50,6 +50,8 @@ class GeminiExplainer:
         self.groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip()
         self.groq_model = (os.getenv("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 
+        self._last_tavily_answer: str | None = None
+
         logger.info(
             "LLM provider=%s, groq_model=%s, gemini_model=%s",
             self.llm_provider, self.groq_model, self.model,
@@ -64,6 +66,7 @@ class GeminiExplainer:
         import concurrent.futures
         tavily_results: list[dict[str, Any]] = []
         fact_check_results: list[dict[str, str]] = []
+        self._last_tavily_answer = None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             tavily_future = executor.submit(self._search_tavily, text)
@@ -121,7 +124,7 @@ class GeminiExplainer:
             "query": query[:400],  # Tavily query limit
             "search_depth": "basic",
             "max_results": 5,
-            "include_answer": False,
+            "include_answer": True,
         }
 
         try:
@@ -134,9 +137,10 @@ class GeminiExplainer:
                 data = json.loads(response.read().decode("utf-8"))
 
             results = data.get("results", [])
+            self._last_tavily_answer = data.get("answer")
             logger.info(
-                "Tavily search succeeded: %d results for query=%s",
-                len(results), query[:80],
+                "Tavily search succeeded: %d results (answer_present=%s) for query=%s",
+                len(results), bool(self._last_tavily_answer), query[:80],
             )
             return results
 
@@ -265,11 +269,13 @@ class GeminiExplainer:
         models_to_try: list[str] = []
         for model_name in [
             self.model,
+            "gemini-1.5-flash",
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
             "gemini-flash-latest",
             "gemini-1.5-flash-8b",
-            "gemini-2.0-flash",
         ]:
             normalized = model_name.strip()
             if normalized and normalized not in models_to_try:
@@ -429,6 +435,22 @@ class GeminiExplainer:
         logger.info("Fact Check API returned %d results for claim", len(results))
         return results
 
+    def _clean_text_snippet(self, raw: str) -> str:
+        if not raw:
+            return ""
+        text = re.sub(r"<[^>]+>", " ", str(raw))
+        text = re.sub(r"[\r\n\t]+", " ", text)
+        # Remove separator bars, bullet symbols, common clickbait prefixes
+        text = re.sub(r"[•|·»«]+", " ", text)
+        text = re.sub(r"^(Watch|Video|LIVE|HIGHLIGHTS|BREAKING|EXCLUSIVE|REPORT|Full match)\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
+        # Remove common social media/YouTube clickbait phrases
+        text = re.sub(r"\b(Bach Gya|Dekho kya hua|Watch full|Subscribe|Subscribe now|Trending video)\b.*?[:\-•]", "", text, flags=re.IGNORECASE)
+        # Remove dangling unclosed parens or brackets at end or start
+        text = re.sub(r"\s*[\(\[\{][^\)\]\}]*$", "", text)
+        text = re.sub(r"^[\)\]\}]\s*", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
     def _build_prompt(
         self,
         text: str,
@@ -444,19 +466,21 @@ class GeminiExplainer:
         web_search_section = ""
         if web_search_results:
             lines = ["\n--- LIVE WEB SEARCH RESULTS (retrieved just now) ---"]
+            if getattr(self, "_last_tavily_answer", None):
+                lines.append(f"AI Grounded Summary: {self._last_tavily_answer}\n")
             for i, r in enumerate(web_search_results, 1):
+                clean_c = self._clean_text_snippet(r.get('content', ''))
                 lines.append(
                     f"{i}. [{r.get('title', 'Untitled')}]({r.get('url', '')})\n"
-                    f"   {r.get('content', '')[:300]}"
+                    f"   {clean_c[:280]}"
                 )
             lines.append(
                 "\n--- END OF WEB SEARCH RESULTS ---\n"
-                "IMPORTANT: You have REAL, CURRENT web search results above. "
-                "Use this information to ground your analysis. "
-                "Do NOT say 'I don't have live access' or 'I cannot verify this in real-time' — "
-                "you have real search results right here. "
-                "If the search results don't contain relevant info for the claim, say so specifically "
-                "(e.g. 'search results did not contain information about X') rather than giving a generic disclaimer.\n"
+                "IMPORTANT RULES FOR USING SEARCH RESULTS:\n"
+                "- Extract the relevant and current facts from the search results above.\n"
+                "- DISCARD irrelevant, outdated news, or past squads from old years.\n"
+                "- Arrange and synthesize the facts into a clean, human, and directly understandable answer.\n"
+                "- Never dump raw search titles, video headings, or fragmented sentences.\n"
             )
             web_search_section = "\n".join(lines)
 
@@ -480,38 +504,36 @@ class GeminiExplainer:
             "STEP 1: DETECT USER INTENT (MANDATORY):\n"
             "Determine if the user input is:\n"
             "A) INFORMATIONAL QUESTION ('mode': 'ANSWER'):\n"
-            "   - The user is asking for direct factual knowledge, prices, specs, dates, definitions, match scores, explanations, or general inquiries (e.g. 'iphone 18 price kitna hoga', 'who is the president of india', 'what is photosynthesis', 'ipl 2026 kab start hoga', 'ind vs jpn match summary').\n"
-            "   - In this mode, do NOT treat it as a suspicious rumor or show verification doubt percentages. Instead provide a crisp, accurate, direct answer.\n"
+            "   - The user is asking for direct factual knowledge, match scores/results, prices, specs, dates, definitions, or inquiries (e.g. 'aj ind vs jpn match me kon jita', 'iphone 18 price kitna hoga', 'who won the match', 'who is the president of india', 'what is photosynthesis', 'ipl 2026 kab start hoga').\n"
+            "   - In this mode, provide a crisp, accurate, direct answer without doubt percentages.\n"
             "   - 'verdict': 'FACTUAL_ANSWER'\n"
             "   - 'percentage': 100\n"
             "   - 'is_ai_generated': false\n"
-            "   - 'direct_answer': A comprehensive, crystal-clear direct answer answering the user's question directly (e.g., specific price, exact date, definition, or current status).\n"
-            "   - 'explanation': Array of 2-4 key factual highlights, specifications, details, or breakdown.\n"
+            "   - 'direct_answer': 1 to 2 clear, direct sentences stating the exact bottom-line fact or match outcome (e.g. 'India ne Japan ko [X] runs/wickets se harakar match jeet liya hai.').\n"
+            "   - 'explanation': Strictly 2 to 3 short bullet points (15-20 words each) giving clean highlights (e.g., Bullet 1: Score summary, Bullet 2: Top scorers/performers, Bullet 3: Tournament/stage context).\n"
             "   - 'corrected_info': null\n"
-            "   - 'related_questions': Array of 3 relevant follow-up questions the user might ask next.\n\n"
+            "   - 'related_questions': Array of 3 relevant follow-up questions.\n\n"
             "B) CLAIM / RUMOR / FACT-CHECK VERIFICATION ('mode': 'VERIFY'):\n"
             "   - The user is asking to verify a specific news item, rumor, viral claim, controversial statement, or media authenticity (e.g. 'kya ye sach hai ki india asia me h', 'did government announce 5000 rs bonus?', 'is modi ji dead?', 'is this video real or AI?', 'earth is flat').\n"
             "   - 'verdict': 'LIKELY_REAL' | 'LIKELY_FAKE' | 'AI_GENERATED' | 'NEEDS_REVIEW' | 'INSUFFICIENT_EVIDENCE'\n"
             "   - 'percentage': 0-100 (0-25 for fake/AI generated, 75-100 for verified real, 50 for unverified/mixed)\n"
             "   - 'is_ai_generated': true if content is AI generated/deepfake, false otherwise\n"
             "   - 'direct_answer': 1-2 sentences giving the crystal-clear direct bottom-line truth/verdict (e.g., 'Ha, ye bilkul sach hai ki India Asia continent me hai.' or 'Nahi, ye claim poori tarah se fake aur baseless hai.').\n"
-            "   - 'explanation': Array of 2-5 bullet points giving specific evidence, verified sources, or reasons.\n"
-            "   - 'corrected_info': String with the factual correction if fake/misleading, else null.\n"
-            "   - 'related_questions': Array of 3 relevant follow-up questions the user might ask next.\n\n"
-            "LANGUAGE MATCHING RULE (MANDATORY - MIRROR USER'S LANGUAGE):\n"
-            "- You MUST write 'direct_answer', 'explanation' bullets, 'corrected_info', and 'related_questions' in the exact same language and dialect as the user's input:\n"
-            "  * If user wrote in HINGLISH (Hindi in English script, e.g. 'iphone 18 ka price kitna h', 'kya ye sach hai'): Respond in natural, conversational HINGLISH.\n"
-            "  * If user wrote in ENGLISH: Respond in clear ENGLISH.\n"
-            "  * If user wrote in HINDI (Devanagari): Respond in HINDI.\n"
-            "  * If user wrote in another regional language: Mirror that language.\n\n"
-            "Output ONLY valid JSON with this exact schema (no markdown, no preamble):\n"
+            "   - 'explanation': Array of 2-3 concise bullet points with verified evidence.\n"
+            "   - 'corrected_info': String with factual correction if fake/misleading, else null.\n"
+            "   - 'related_questions': Array of 3 relevant follow-up questions.\n\n"
+            "CRITICAL RELEVANCE & CONCISENESS RULES (MANDATORY):\n"
+            "1. NO ROBOTIC PREFIXES: Do NOT start direct_answer with 'Based on latest search results:' or 'According to live data:'. Start directly with the answer.\n"
+            "2. CLEAN & RELEVANT: Only include facts directly relevant to the user's question. Do not paste YouTube titles, raw snippets, or outdated squads from previous years.\n"
+            "3. LANGUAGE MATCHING: Write in the EXACT SAME language and tone as the user's input (Hinglish -> natural Hinglish, English -> clear English, Hindi -> Hindi).\n\n"
+            "Output ONLY valid JSON starting directly with { (no markdown, no backticks):\n"
             "{\n"
             '  "mode": <"ANSWER" | "VERIFY">,\n'
-            '  "direct_answer": <string>,\n'
+            '  "direct_answer": <string 1-2 clear sentences>,\n'
             '  "percentage": <integer 0-100>,\n'
             '  "verdict": <"FACTUAL_ANSWER" | "LIKELY_REAL" | "LIKELY_FAKE" | "AI_GENERATED" | "NEEDS_REVIEW" | "INSUFFICIENT_EVIDENCE">,\n'
             '  "is_ai_generated": <boolean>,\n'
-            '  "explanation": <array of 2-5 short bullet strings>,\n'
+            '  "explanation": <array of 2-3 short bullet strings>,\n'
             '  "corrected_info": <string or null>,\n'
             '  "related_questions": <array of 3 follow-up question strings>\n'
             "}\n\n"
@@ -529,38 +551,71 @@ class GeminiExplainer:
         sources: list[dict[str, str]],
         grounded: bool,
     ) -> ExplanationResult:
-        """Create an intelligent synthesized fallback when LLMs are unreachable."""
+        """Create an intelligent, clean, and concise synthesized fallback when LLMs are unreachable."""
         lower = text.lower()
         is_question = bool(
             "?" in text
             or any(w in lower for w in [
                 "what", "who", "when", "where", "how", "why", "price", "cost", "score",
-                "kya", "kab", "kaise", "kitna", "kon", "kaha", "kyu", "kisne", "batao"
+                "kya", "kab", "kaise", "kitna", "kon", "kaha", "kyu", "kisne", "batao", "match", "jeeta", "jita"
             ])
         ) and not any(w in lower for w in ["kya ye sach hai", "is it true", "fake or real", "real or fake", "fake hai ya real"])
 
-        if tavily_results:
-            top_contents = [r.get("content", "").strip() for r in tavily_results if r.get("content")]
-            summary_bullet = top_contents[0][:200] if top_contents else "Search results retrieved."
-            bullets = [c[:180] for c in top_contents[:3]] if top_contents else ["Live web search context analyzed."]
-            direct_ans = f"Based on latest search results: {summary_bullet}"
+        if tavily_results or getattr(self, "_last_tavily_answer", None):
+            tavily_ans = self._clean_text_snippet(getattr(self, "_last_tavily_answer", "") or "")
+            clean_bullets: list[str] = []
+
+            # Score candidates
+            priority_keywords = ["won", "win", "defeated", "beat", "scored", "wickets", "runs", "goals", "jeet", "haraya", "price", "launched", "confirmed", "official"]
+
+            candidate_sentences = []
+            for r in tavily_results:
+                raw_c = self._clean_text_snippet(r.get("content", ""))
+                sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_c) if len(s.strip()) > 20 and not s.strip().endswith("(")]
+                for s in sentences:
+                    # Exclude squad lists and unhelpful metadata
+                    if len(s) < 180 and not any(kw in s.lower() for kw in ["squad:", "playing xi", "subscribe", "youtube", "vs japan only t-20"]):
+                        score = sum(2 for kw in priority_keywords if kw in s.lower())
+                        candidate_sentences.append((score, s))
+
+            # Sort by relevance score
+            candidate_sentences.sort(key=lambda x: x[0], reverse=True)
+
+            for _, s in candidate_sentences:
+                if s not in clean_bullets and not any(s in b or b in s for b in clean_bullets):
+                    clean_bullets.append(s)
+                    if len(clean_bullets) >= 3:
+                        break
+
+            if not clean_bullets and tavily_results:
+                first_c = self._clean_text_snippet(tavily_results[0].get("content", "")[:140])
+                if first_c:
+                    clean_bullets = [first_c]
+
+            if not tavily_ans:
+                if clean_bullets:
+                    tavily_ans = clean_bullets[0]
+                else:
+                    tavily_ans = f"Information retrieved for: {text[:80]}"
+
             mode = "ANSWER" if is_question else "VERIFY"
             verdict = "FACTUAL_ANSWER" if is_question else "LIKELY_REAL"
             pct = 100 if is_question else 85
+
             return ExplanationResult(
                 percentage=pct,
                 verdict=verdict,
-                explanation=bullets,
+                explanation=clean_bullets or ["Details retrieved from verified web sources."],
                 corrected_info=None,
                 sources=sources,
                 grounded=grounded,
                 is_ai_generated=False,
                 mode=mode,
-                direct_answer=direct_ans,
+                direct_answer=tavily_ans,
                 related_questions=[
-                    f"Tell me more details about {text[:30]}",
-                    f"What are latest updates on this?",
-                    f"Are there any official sources for this?"
+                    "What were the top highlights of this event?",
+                    "Are there official statements or statistics?",
+                    "What is the next match or upcoming schedule?",
                 ],
             )
 
@@ -576,7 +631,7 @@ class GeminiExplainer:
             verdict=label,
             explanation=[
                 "Automated classification model evaluated this statement.",
-                "Real-time external reasoning is currently busy; standard heuristic analysis was applied.",
+                "Live external reasoning was unavailable; standard heuristic analysis was applied.",
             ],
             corrected_info=None,
             sources=sources,
