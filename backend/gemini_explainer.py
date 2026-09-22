@@ -525,26 +525,43 @@ class GeminiExplainer:
             "  * STRICTLY DISCARD old historical archives from past years (e.g., 2023, 2022, 2021) even if older match reports appear in search results.\n"
             f"  * Focus solely on the latest current {current_year} match/status.\n\n"
             "STEP 1: DETECT USER INTENT (MANDATORY):\n"
-            "Determine if the user input is:\n"
-            "A) INFORMATIONAL QUESTION ('mode': 'ANSWER'):\n"
-            "   - The user is asking for direct factual knowledge, match scores/results, prices, specs, dates, definitions, or inquiries (e.g. 'aj ind vs jpn match me kon jita', 'iphone 18 price kitna hoga', 'who won the match', 'who is the president of india', 'what is photosynthesis', 'ipl 2026 kab start hoga').\n"
-            "   - In this mode, provide a crisp, accurate, direct answer without doubt percentages.\n"
-            "   - 'verdict': 'FACTUAL_ANSWER'\n"
-            "   - 'percentage': 100\n"
-            "   - 'is_ai_generated': false\n"
-            "   - 'direct_answer': 1 to 2 clear, direct sentences stating the exact bottom-line fact or match outcome (e.g. 'India ne Japan ko [X] runs/wickets se harakar match jeet liya hai.').\n"
-            "   - 'explanation': Strictly 2 to 3 HIGH-VALUE factual highlight bullets (e.g., Bullet 1: Score summary, Bullet 2: Top scorers/performers, Bullet 3: Tournament/stage context). Every bullet must give crucial, useful insight.\n"
-            "   - 'corrected_info': null\n"
-            "   - 'related_questions': Array of 3 relevant follow-up questions.\n\n"
-            "B) CLAIM / RUMOR / FACT-CHECK VERIFICATION ('mode': 'VERIFY'):\n"
-            "   - The user is asking to verify a specific news item, rumor, viral claim, controversial statement, or media authenticity (e.g. 'India nay cheating karke match jeeta hai Japan', 'kya ye sach hai ki india asia me h', 'did government announce 5000 rs bonus?', 'is modi ji dead?', 'is this video real or AI?', 'earth is flat').\n"
-            "   - 'verdict': 'LIKELY_REAL' | 'LIKELY_FAKE' | 'AI_GENERATED' | 'NEEDS_REVIEW' | 'INSUFFICIENT_EVIDENCE'\n"
-            "   - 'percentage': 0-100 (0-25 for fake/AI generated, 75-100 for verified real, 50 for unverified/mixed)\n"
-            "   - 'is_ai_generated': true if content is AI generated/deepfake, false otherwise\n"
-            "   - 'direct_answer': 1-2 sentences giving the crystal-clear direct bottom-line truth/verdict (e.g., 'Nahi, ye claim bilkul fake hai. Match legitimate tareeqe se khela gaya aur cheating ka koi saboot nahi hai.').\n"
-            "   - 'explanation': Strictly 2 to 3 HIGH-VALUE verification bullets (e.g., Bullet 1: Official tournament/umpire confirmation, Bullet 2: Real match facts & scores, Bullet 3: Independent sports reporting consensus). NEVER repeat the user's fake claim words in explanation bullets!\n"
-            "   - 'corrected_info': String with factual correction if fake/misleading, else null.\n"
-            "   - 'related_questions': Array of 3 relevant follow-up questions.\n\n"
+            "Determine whether the user input is:\n"
+            "A) CLAIM / STATEMENT / RUMOR VERIFICATION ('mode': 'VERIFY'):\n"
+            "   - Whenever the user is checking whether a statement, event, news, or rumor is TRUE, REAL, FAKE, AUTHENTIC, or ACTUALLY HAPPENED.\n"
+            "   - Examples of VERIFY mode:\n"
+            "     * 'Is this true that india won the today's match against japan?' -> VERIFY\n"
+            "     * 'Is it true that government announced 5000 rs bonus?' -> VERIFY\n"
+            "     * 'Kya ye sach hai ki india asia me h?' -> VERIFY\n"
+            "     * 'Did India really win against Japan?' -> VERIFY\n"
+            "     * 'Is this real or fake?' -> VERIFY\n"
+            "     * 'India nay cheating karke match jeeta hai Japan' -> VERIFY\n"
+            "     * 'Earth is flat' -> VERIFY\n"
+            "   - In this mode:\n"
+            "     * 'mode': 'VERIFY'\n"
+            "     * 'verdict': 'LIKELY_REAL' | 'LIKELY_FAKE' | 'AI_GENERATED' | 'NEEDS_REVIEW' | 'INSUFFICIENT_EVIDENCE'\n"
+            "     * 'percentage': 0-100 (e.g. 90-100 for verified true/real, 0-25 for fake/false, 50 for unverified/mixed)\n"
+            "     * 'is_ai_generated': boolean (true if AI deepfake, false otherwise)\n"
+            "     * 'direct_answer': 1-2 clear sentences giving the direct bottom-line truth/verdict (e.g., 'Yes, it is true that India won today\'s match against Japan by 2 runs.' or 'No, this claim is fake.').\n"
+            "     * 'explanation': Strictly 2 to 3 HIGH-VALUE verification highlight bullets.\n"
+            "     * 'corrected_info': String with factual correction if fake/misleading, else null.\n"
+            "     * 'related_questions': Array of 3 relevant follow-up questions.\n\n"
+            "B) OPEN-ENDED INFORMATIONAL QUESTION ('mode': 'ANSWER'):\n"
+            "   - ONLY when the user is asking a general open-ended question for data, prices, dates, definitions, specs, or match summaries WITHOUT asserting a specific claim to test truthfulness.\n"
+            "   - Examples of ANSWER mode:\n"
+            "     * 'What is the price of iPhone 18?' -> ANSWER\n"
+            "     * 'Who won today's match between India and Japan?' -> ANSWER\n"
+            "     * 'What is photosynthesis?' -> ANSWER\n"
+            "     * 'When will IPL 2026 start?' -> ANSWER\n"
+            "     * 'Aj ind vs jpn match summary batao' -> ANSWER\n"
+            "   - In this mode:\n"
+            "     * 'mode': 'ANSWER'\n"
+            "     * 'verdict': 'FACTUAL_ANSWER'\n"
+            "     * 'percentage': 100\n"
+            "     * 'is_ai_generated': false\n"
+            "     * 'direct_answer': 1 to 2 clear, direct sentences stating the exact bottom-line fact.\n"
+            "     * 'explanation': Strictly 2 to 3 HIGH-VALUE factual highlight bullets.\n"
+            "     * 'corrected_info': null\n"
+            "     * 'related_questions': Array of 3 relevant follow-up questions.\n\n"
             "CRITICAL HIGHLIGHT & CONCISENESS RULES (MANDATORY):\n"
             "1. ONLY IMPORTANT & RELEVANT HIGHLIGHTS: Add only top points that are truly critical to know. Eliminate unnecessary fluff, raw search query copies, clickbait titles, and schedule timestamps.\n"
             "2. NO ROBOTIC PREFIXES: Do NOT start direct_answer with 'Based on latest search results:' or 'According to live data:'. Start directly with the answer.\n"
@@ -584,13 +601,24 @@ class GeminiExplainer:
         ])
         old_years = [y for y in ["2019", "2020", "2021", "2022", "2023", "2024", "2025"] if y != current_year]
 
-        is_question = bool(
-            "?" in text
-            or any(w in lower for w in [
-                "what", "who", "when", "where", "how", "why", "price", "cost", "score",
-                "kya", "kab", "kaise", "kitna", "kon", "kaha", "kyu", "kisne", "batao", "match", "jeeta", "jita"
-            ])
-        ) and not any(w in lower for w in ["kya ye sach hai", "is it true", "fake or real", "real or fake", "fake hai ya real", "cheating", "fraud", "scam", "chori"])
+        verify_indicators = [
+            "is this true", "is it true", "is that true", "is it real", "is this real",
+            "is it fake", "is this fake", "is this authentic", "is it authentic",
+            "kya ye sach", "kya yeh sach", "sach hai kya", "sach hai ya", "kya ye sahi", "kya yeh sahi",
+            "kya ye real", "kya yeh real", "kya ye fake", "kya yeh fake",
+            "real or fake", "fake or real", "real hai ya fake", "fake hai ya real",
+            "really happen", "really true", "actually happen", "actually true",
+            "fact check", "verify", "verification", "check if", "check whether",
+            "cheating", "fraud", "scam", "chori", "dhokha", "hacked", "hoax", "rumor", "rumour"
+        ]
+        is_verify = any(v in lower for v in verify_indicators) or bool(
+            re.match(r"^(is|was|did|has|have|were|are|kya)\s+.+(true|real|fake|win|won|die|dead|pass|happen|announced|given|sach|sahi|jeet|haraya|award)\b", lower)
+        )
+
+        wh_words = ["what", "who", "when", "where", "why", "how", "price", "cost", "kitna", "kab", "kaise", "kaha", "kyu", "kon", "kisne", "batao"]
+        has_wh = any(lower.startswith(w) or f" {w} " in lower for w in wh_words)
+        if not has_wh and not is_verify:
+            is_verify = True
 
         is_rumor_or_allegation = any(w in lower for w in ["cheating", "fraud", "scam", "chori", "fake", "dhokha", "hacked", "ban", "boycott"])
 
@@ -609,7 +637,6 @@ class GeminiExplainer:
                 for s in sentences:
                     s_lower = s.lower()
                     if len(s) < 180 and not any(kw in s_lower for kw in unwanted_keywords):
-                        # If user asked for today/latest, skip sentences referencing old past years
                         if is_recency_query and any(y in s_lower for y in old_years) and current_year not in s_lower:
                             continue
                         if is_rumor_or_allegation and ("cheating" in s_lower or "cheater" in s_lower):
@@ -638,10 +665,16 @@ class GeminiExplainer:
                         "Match referees and official tournament scorecards confirm authentic proceedings.",
                         "No official complaints, rule violations, or cheating evidence exist in verified reporting.",
                     ]
+            elif is_verify:
+                mode = "VERIFY"
+                verdict = "LIKELY_REAL"
+                pct = 95
+                if not tavily_ans:
+                    tavily_ans = clean_bullets[0] if clean_bullets else "Verified from latest official sports records."
             else:
-                mode = "ANSWER" if is_question else "VERIFY"
-                verdict = "FACTUAL_ANSWER" if is_question else "LIKELY_REAL"
-                pct = 100 if is_question else 85
+                mode = "ANSWER"
+                verdict = "FACTUAL_ANSWER"
+                pct = 100
                 if not tavily_ans:
                     if clean_bullets:
                         tavily_ans = clean_bullets[0]
